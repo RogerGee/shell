@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <sys/fcntl.h>
 
 extern const char* programName;
 extern void raise_exception(const char* message);
@@ -15,16 +16,50 @@ extern void raise_exception(const char* message);
 /* utility types */
 
 /* cmdargv */
-void cmdargv_init(struct cmdargv* argv)
+struct cmdargv
+{
+    char** argv;
+    size_t argc, argcap;
+
+    char* argbuf;
+    size_t argbufHead, argbufcap;
+
+    /* if false, then the command-line was incomplete */
+    int state;
+};
+static void cmdargv_init(struct cmdargv* argv)
 {
     argv->argc = 0;
     argv->argcap = 8;
     argv->argv = malloc(argv->argcap * sizeof(char*));
+    if (argv->argv == NULL)
+        raise_exception("out of memory");
     argv->argv[0] = NULL;
     argv->argbufcap = 4096;
     argv->argbuf = malloc(argv->argbufcap);
+    if (argv->argbuf == NULL)
+        raise_exception("out of memory");
     argv->argbufHead = 0;
     argv->state = 1;
+}
+static void cmdargv_delete(struct cmdargv* argv)
+{
+    free(argv->argv);
+    free(argv->argbuf);
+}
+struct cmdargv* cmdargv_new()
+{
+    struct cmdargv* argv;
+    argv = malloc(sizeof(struct cmdargv));
+    if (argv == NULL)
+        raise_exception("out of memory");
+    cmdargv_init(argv);
+    return argv;
+}
+void cmdargv_free(struct cmdargv* argv)
+{
+    cmdargv_delete(argv);
+    free(argv);
 }
 static int cmdargv_check_resize_argv(struct cmdargv* argv)
 {
@@ -42,7 +77,7 @@ static int cmdargv_check_resize_argv(struct cmdargv* argv)
     }
     return 1;
 }
-int cmdargv_parse(struct cmdargv* argv,char* cmdline)
+int cmdargv_parse(struct cmdargv* argv,const char* cmdline)
 {
     /* parses the command-line string into an argument vector; the
        command-line should be terminated with a '\n' character */
@@ -132,6 +167,10 @@ int cmdargv_parse(struct cmdargv* argv,char* cmdline)
     argv->argv[argv->argc] = NULL;
     return 1;
 }
+const char* const* cmdargv_get_argv(struct cmdargv* argv)
+{
+    return (const char* const*)argv->argv;
+}
 void cmdargv_reset(struct cmdargv* argv)
 {
     argv->argc = 0;
@@ -140,17 +179,42 @@ void cmdargv_reset(struct cmdargv* argv)
     argv->argbuf[0] = 0;
     argv->state = 1;
 }
-void cmdargv_delete(struct cmdargv* argv)
-{
-    free(argv->argv);
-    free(argv->argbuf);
-}
 
 /* process */
+struct process
+{
+    /* information to create process; strings are stored by reference */
+    int input, /* if -1, then inherit; else they are duped and closed */ 
+        output,
+        error;
+    const char* exec;
+    char* const* argv;
+
+    /* running process */
+    pid_t pid;
+    int exitCode;
+};
+static void process_init(struct process* proc,const char* const argv[])
+{
+    proc->input = proc->output = proc->error = -1;
+    proc->exec = argv[0];
+    proc->argv = (char* const*)argv;
+    proc->pid = (pid_t)-1;
+    proc->exitCode = -1;
+}
+static void process_delete(struct process* proc)
+{
+    process_kill(proc);
+    process_wait(proc);
+    proc->exec = NULL;
+    proc->argv = NULL;
+}
 struct process* process_new(const char* const argv[])
 {
     struct process* proc;
     proc = malloc(sizeof(struct process));
+    if (proc == NULL)
+        raise_exception("out of memory");
     process_init(proc,argv);
     return proc;
 }
@@ -159,21 +223,11 @@ void process_free(struct process* proc)
     process_delete(proc);
     free(proc);
 }
-void process_init(struct process* proc,const char* const argv[])
-{
-    proc->input = proc->output = proc->error = -1;
-    proc->exec = argv[0];
-    proc->argv = (char* const*)argv;
-    proc->pid = (pid_t)-1;
-    proc->exitCode = -1;
-}
 void process_assign_stdio(struct process* proc,int input,int output,int error)
 {
-    if (proc->pid != (pid_t)-1) {
-        proc->input = input;
-        proc->output = output;
-        proc->error = error;
-    }
+    proc->input = input;
+    proc->output = output;
+    proc->error = error;
 }
 int process_exec(struct process* proc)
 {
@@ -203,7 +257,7 @@ int process_exec(struct process* proc)
             execvp(proc->exec,proc->argv);
             /* command could not be executed */
             fprintf(stderr,"%s: No command '%s' found\n",programName,proc->exec);
-            exit(-1);
+            exit(EXIT_FAILURE);
         }
         else {
             /* close descriptors that were (hopefully) duped in the child */
@@ -302,10 +356,346 @@ int process_kill(struct process* proc)
     }
     return -1;
 }
-void process_delete(struct process* proc)
+
+/* job_argv */
+struct dyninfo {
+    size_t head;
+    size_t capc;
+    const char** argv;
+};
+static void dyninfo_init(struct dyninfo* info)
 {
-    process_kill(proc);
-    process_wait(proc);
-    proc->exec = NULL;
-    proc->argv = NULL;
+    info->argv = NULL;
+    info->head = 0;
+    info->capc = 0;
 }
+static int dyninfo_alloc(struct dyninfo* info)
+{
+    void* buf;
+    size_t capc;
+    capc = info->argv == NULL ? 8 : (info->capc << 1);
+    buf = realloc(info->argv,sizeof(const char*) * capc);
+    if (buf == NULL)
+        return 0;
+    info->argv = buf;
+    info->capc = capc;
+    return 1;
+}
+static void dyninfo_delete(struct dyninfo* info)
+{
+    free(info->argv);
+    info->argv = NULL;
+}
+struct job_argv_buffer
+{
+    size_t head, capc;
+    struct dyninfo* info; /* array info for each job command-line */
+    const char* outFile, *outFileAppend;
+    const char* inFile;
+};
+static void job_argv_buffer_init(struct job_argv_buffer* buf)
+{
+    size_t i;
+    buf->head = 0;
+    buf->capc = 8;
+    buf->info = malloc(sizeof(struct dyninfo) * buf->capc);
+    if (buf->info == NULL)
+        raise_exception("out of memory");
+    for (i = 0;i < buf->capc;++i)
+        dyninfo_init(buf->info+i);
+    buf->outFile = buf->outFileAppend = buf->inFile = NULL;
+}
+static void job_argv_buffer_delete(struct job_argv_buffer* buf)
+{
+    size_t i;
+    for (i = 0;i < buf->capc;++i)
+        dyninfo_delete(buf->info+i);
+    free(buf->info);
+}
+struct job_argv_buffer* job_argv_buffer_new()
+{
+    struct job_argv_buffer* buf;
+    buf = malloc(sizeof(struct job_argv_buffer));
+    if (buf == NULL)
+        raise_exception("out of memory");
+    job_argv_buffer_init(buf);
+    return buf;
+}
+void job_argv_buffer_free(struct job_argv_buffer* buf)
+{
+    job_argv_buffer_delete(buf);
+    free(buf);
+}
+static int job_argv_buffer_append(struct job_argv_buffer* buf,size_t index,const char* arg)
+{
+    /* check if a new command needs to be added */
+    struct dyninfo* ins;
+    if (index >= buf->head) {
+        if (buf->head >= buf->capc) {
+            void* newbuf;
+            size_t iter, newcapc;
+            newcapc = buf->capc << 1;
+            newbuf = realloc(buf->info,sizeof(struct dyninfo) * newcapc);
+            if (newbuf == NULL)
+                return 0;
+            buf->info = newbuf;
+            buf->capc = newcapc;
+            for (iter = buf->head;iter < buf->capc;++iter)
+                dyninfo_init(buf->info+iter);
+        }
+        ins = buf->info + buf->head;
+        ++buf->head;
+    }
+    else
+        ins = buf->info + index;
+    if (ins->head>=ins->capc && !dyninfo_alloc(ins))
+        return 0;
+    ins->argv[ins->head++] = arg;
+    return 1;
+}
+int job_argv_buffer_transform(struct job_argv_buffer* buf,struct cmdargv* argv)
+{
+    char s = 1;
+    char* arg;
+    size_t comdex = 0;
+    char** v = argv->argv;
+    arg = *v++;
+    while (1) {
+        if (arg == NULL) {
+            if (!job_argv_buffer_append(buf,comdex,NULL))
+                /* make sure that the buffer is null-terminated */
+                buf->info[buf->head-1].argv[buf->info[buf->head-1].head-1] = NULL;
+            break;
+        }
+        else if (arg[0] == '<') {
+            /* < file syntax: job input comes from specified file */
+            buf->inFile = arg[1] ? arg+1 : *v++;
+            arg = *v++;
+        }
+        else if (arg[0] == '>') {
+            /* > file (>> file) syntax; job output goes to file; >> is append mode */
+            if (arg[1] == '>')
+                buf->outFileAppend = arg[2] ? arg+2 : *v++;
+            else
+                buf->outFile = arg[1] ? arg+1 : *v++;
+            arg = *v++;
+        }
+        else if (arg[0] == '|') {
+            if (s == 0) {
+                fprintf(stderr,"%s: syntax: unexpected '|' in command-line\n",programName);
+                return 0;
+            }
+            /* add a null-ptr to the buffer to signal the end of the last command; then update
+               comdex so that it will create a new command next time */
+            if (!job_argv_buffer_append(buf,comdex,NULL)) {
+                /* make sure that the buffer is null-terminated */
+                buf->info[buf->head-1].argv[buf->info[buf->head-1].head-1] = NULL;
+                break;
+            }
+            arg = arg[1] ? arg+1 : *v++;
+            ++comdex;
+            s = 0;
+        }
+        else {
+            if (!job_argv_buffer_append(buf,comdex,arg)) {
+                /* make sure that the buffer is null-terminated */
+                buf->info[buf->head-1].argv[buf->info[buf->head-1].head-1] = NULL;
+                break;
+            }
+            arg = *v++;
+            s = 1;
+        }
+    }
+    if (s == 0) {
+        fprintf(stderr,"%s: syntax: expected command name after '|'\n",programName);
+        return 0;
+    }
+    return 1;
+}
+void job_argv_buffer_reset(struct job_argv_buffer* buf)
+{
+    size_t iter;
+    for (iter = 0;iter < buf->head;++iter)
+        buf->info[iter].head = 0;
+    buf->head = 0;
+    buf->outFile = buf->outFileAppend = buf->inFile = NULL;
+}
+
+/* job */
+struct job
+{
+    /* bitmask:
+        bit0: errorflag
+        bit1: is job_ex */
+    short flags;
+
+    /* input to job; output from job; error from job:
+        if these are -1, then input/output is inherited; otherwise
+       they are duped; they handles are not closed until the job
+       is deleted so that they are available to the user */
+    int input, output, error;
+
+    /* process information */
+    struct process* procs;
+    size_t proccnt;
+};
+/* this subclass stores an internal argument buffer */
+struct job_ex
+{
+    struct job _base;
+
+    /* command-line argument buffers */
+    struct cmdargv argv;
+    struct job_argv_buffer buf;
+};
+
+static void job_init(struct job* job,struct job_argv_buffer* buffer)
+{
+    int p[2];
+    size_t iter;
+    job->proccnt = buffer->head;
+    job->procs = malloc(sizeof(struct process) * job->proccnt);
+    job->flags = 0;
+    if (buffer->outFile != NULL) {
+        job->output = open(buffer->outFile,O_WRONLY|O_CREAT|O_TRUNC,0666);
+        if (job->output == -1) {
+            fprintf(stderr,"%s: cannot open file '%s' for writing: %s\n",programName,buffer->outFile,strerror(errno));
+            job->flags |= 1;
+            return;
+        }
+    }
+    else if (buffer->outFileAppend != NULL) {
+        job->output = open(buffer->outFileAppend,O_WRONLY|O_CREAT|O_APPEND,0666);
+        if (job->output == -1) {
+            fprintf(stderr,"%s: cannot open file '%s' for append: %s\n",programName,buffer->outFileAppend,strerror(errno));
+            job->flags |= 1;
+            return;
+        }
+    }
+    else
+        job->output = -1;
+    if (buffer->inFile != NULL) {
+        job->input = open(buffer->inFile,O_RDONLY);
+        if (job->input == -1) {
+            fprintf(stderr,"%s: cannot open file '%s' for reading: %s\n",programName,buffer->inFile,strerror(errno));
+            job->flags |= 1;
+            return;
+        }
+    }
+    else
+        job->input = -1;
+    job->error = -1;
+    for (iter = 0;iter < job->proccnt;++iter) {
+        int fds[3] = {-1,-1,-1};
+        process_init(job->procs+iter,(buffer->info+iter)->argv);
+        /* apply redirections; link up processes with pipe object */
+        if (iter > 0)
+            /* assign read end of pipe as input to process; this was
+               left over from a previous iteration */
+            fds[0] = p[0];
+        if (job->proccnt>1 && iter+1<job->proccnt) {
+            /* create pipe; use its write end for the output of
+               the current process; save its read end for input
+               of the next process */
+            if (pipe(p) == -1)
+                raise_exception("system call pipe() failed");
+            fds[1] = p[1];
+        }
+        if (iter==0 && job->input!=-1)
+            /* file as input to first job process */
+            fds[0] = job->input;
+        else if (iter+1 == job->proccnt) {
+            if (job->output != -1)
+                /* file as output from final job process */
+                fds[1] = job->output;
+            if (job->error != -1)
+                /* file as error output from final job process */
+                fds[2] = job->error;
+        }
+        process_assign_stdio(job->procs+iter,fds[0],fds[1],fds[2]);
+    }
+}
+static void job_init_ex(struct job_ex* job,const char* cmdline)
+{
+    /* this variant is similar except we do not apply redirections
+       for the job's input and output; they are silently ignored */
+    int p[2];
+    size_t iter;
+    cmdargv_init(&job->argv);
+    if ( !cmdargv_parse(&job->argv,cmdline) )
+        raise_exception("syntax error in command-line on job creation: fail cmdargv_parse()");
+    job_argv_buffer_init(&job->buf);
+    if ( !job_argv_buffer_transform(&job->buf,&job->argv) )
+        raise_exception("syntax error in command-line on job creation: fail job_argv_buffer_transform");
+    /* ignore redirections */
+    job->buf.outFile = job->buf.outFileAppend = job->buf.inFile = NULL;
+    job_init(&job->_base,&job->buf); /* call base-class constructor */
+    job->_base.flags |= 2; /* set subclass bit to true */
+}
+static void job_delete(struct job* job)
+{
+    job_kill(job);
+    job_wait(job);
+    free(job->procs);
+    if (job->flags & 2) {
+        job_argv_buffer_delete(&((struct job_ex*)job)->buf);
+        cmdargv_delete(&((struct job_ex*)job)->argv);
+    }
+}
+struct job* job_new(struct job_argv_buffer* buffer)
+{
+    struct job* job;
+    job = malloc(sizeof(struct job));
+    if (job == NULL)
+        raise_exception("out of memory");
+    job_init(job,buffer);
+    return job;
+}
+struct job* job_new_ex(const char* cmdline)
+{
+    struct job_ex* job;
+    job = malloc(sizeof(struct job_ex));
+    if (job == NULL)
+        raise_exception("out of memory");
+    job_init_ex(job,cmdline);
+    return (struct job*)job;
+}
+void job_free(struct job* job)
+{
+    job_delete(job);
+    free(job);
+}
+int job_error_flag(struct job* job)
+{
+    /* see if bit0 is set (binary 1) */
+    return job->flags & 0x01;
+}
+void job_assign_stdio(struct job* job,int input,int output,int error)
+{
+    if (job->input != -1)
+        close(job->input);
+    job->input = input;
+    if (job->output != -1)
+        close(job->output);
+    job->output = output;
+    if (job->error != -1)
+        close(job->error);
+    job->error = error;
+
+}/*
+int job_exec(struct process* proc)
+{
+}
+int job_poll(struct job* job)
+{
+}
+int job_wait(struct job* job)
+{
+}
+int job_wait_timeout(struct job* job,unsigned int msecs)
+{
+}
+int job_kill(struct job* job)
+{
+}
+*/

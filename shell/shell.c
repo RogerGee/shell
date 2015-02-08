@@ -13,8 +13,8 @@ static void message_loop();
 static void print_prompt(int normalPrompt);
 static const char* get_working_directory();
 static int cd(const char* directory);
-/*static int pud(const char* cmdline);
-  static int pod(const char* cmdline);*/
+/*static int pud(const char* directory);
+  static int pod();*/
 static int readline(FILE* fin,char* buf,size_t cap);
 
 int main(int argc,const char* argv[])
@@ -35,30 +35,43 @@ void message_loop()
 {
     int exitCode;
     char cmdline[4096];
-    struct cmdargv argv;
-    cmdargv_init(&argv);
+    struct cmdargv* tokens;             /* store command-line tokens */
+    struct job_argv_buffer* j_tokens;  /* store series of command-line tokens for job */
+    tokens = cmdargv_new();
+    j_tokens = job_argv_buffer_new();
 
     while (1) {
         int c = 0;
+        const char* const* argv;
         do {
             print_prompt(!c++);
 
             if ( !readline(stdin,cmdline,sizeof(cmdline)) )
                 /* received end-of-file on stdin */
                 goto done;
-        } while ( !cmdargv_parse(&argv,cmdline) );
+        } while ( !cmdargv_parse(tokens,cmdline) );
 
-        if (argv.argc > 0) {
-            if (strcmp(argv.argv[0],"cd") == 0)
-                cd(argv.argc > 1 ? argv.argv[1] : NULL);
+        argv = cmdargv_get_argv(tokens);
+        if (argv[0] != NULL) {
+            /* check built-in commands first; otherwise run external command(s) */
+            if (strcmp(argv[0],"cd") == 0)
+                cd(argv[1]);
+            else if (strcmp(argv[0],"exit") == 0)
+                break;
+            else {
+                if (job_argv_buffer_transform(j_tokens,tokens)) {
 
+                }
+                job_argv_buffer_reset(j_tokens);
+            }
         }
 
-        cmdargv_reset(&argv);
+        cmdargv_reset(tokens);
     }
 
 done:
-    cmdargv_delete(&argv);
+    job_argv_buffer_free(j_tokens);
+    cmdargv_free(tokens);
     putchar('\n');
 }
 
@@ -166,12 +179,12 @@ int cd(const char* directory)
     return 1;
 }
 
-/*int pud(const char* cmdline)
+/*int pud(const char* directory)
 {
     return *cmdline;
 }
 
-int pod(const char* cmdline)
+int pod()
 {
     return *cmdline;
     }*/
