@@ -9,6 +9,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <sys/fcntl.h>
+#include <fcntl.h>
 
 extern const char* programName;
 extern void raise_exception(const char* message);
@@ -191,7 +192,7 @@ struct process
     char* const* argv;
 
     /* running process */
-    pid_t pid;
+    pid_t pid, pgid;
     int exitCode;
 };
 static void process_init(struct process* proc,const char* const argv[])
@@ -200,6 +201,7 @@ static void process_init(struct process* proc,const char* const argv[])
     proc->exec = argv[0];
     proc->argv = (char* const*)argv;
     proc->pid = (pid_t)-1;
+    proc->pgid = (pid_t)-1;
     proc->exitCode = -1;
 }
 static void process_delete(struct process* proc)
@@ -236,6 +238,10 @@ int process_exec(struct process* proc)
         if (proc->pid == -1)
             raise_exception("fail fork()");
         if (proc->pid == 0) {
+            int fd;
+            /* if specified, set the process in the specified process group */
+            if (proc->pgid!=-1 && setpgid(0,proc->pgid)==-1)
+                raise_exception("fail setpgid()\n");
             /* if specified, redirect the standard file descriptors
                for this new process */
             if (proc->input != -1) {
@@ -259,7 +265,7 @@ int process_exec(struct process* proc)
             fprintf(stderr,"%s: No command '%s' found\n",programName,proc->exec);
             exit(EXIT_FAILURE);
         }
-        else {
+        else { /* parent */
             /* close descriptors that were (hopefully) duped in the child */
             if (proc->input != -1)
                 close(proc->input);
@@ -269,6 +275,7 @@ int process_exec(struct process* proc)
                 close(proc->error);
             proc->input = proc->output = proc->error = -1;
         }
+        return 0;
     }
     return -1;
 }
@@ -531,13 +538,15 @@ struct job
 
     /* input to job; output from job; error from job:
         if these are -1, then input/output is inherited; otherwise
-       they are duped; they handles are not closed until the job
-       is deleted so that they are available to the user */
+       they are duped; the job functionality is NOT responsible for
+       closing these descriptors; the process functionality will
+       close them so that they don't exist in the parent process */
     int input, output, error;
 
     /* process information */
     struct process* procs;
     size_t proccnt;
+    pid_t pgid; /* process group id */
 };
 /* this subclass stores an internal argument buffer */
 struct job_ex
@@ -555,6 +564,7 @@ static void job_init(struct job* job,struct job_argv_buffer* buffer)
     size_t iter;
     job->proccnt = buffer->head;
     job->procs = malloc(sizeof(struct process) * job->proccnt);
+    job->pgid = (pid_t)-1;
     job->flags = 0;
     if (buffer->outFile != NULL) {
         job->output = open(buffer->outFile,O_WRONLY|O_CREAT|O_TRUNC,0666);
@@ -599,6 +609,8 @@ static void job_init(struct job* job,struct job_argv_buffer* buffer)
                of the next process */
             if (pipe(p) == -1)
                 raise_exception("system call pipe() failed");
+            if (fcntl(p[0],F_SETFD,FD_CLOEXEC)==-1 || fcntl(p[1],F_SETFD,FD_CLOEXEC)==-1)
+                raise_exception("system call fcntl() failed");
             fds[1] = p[1];
         }
         if (iter==0 && job->input!=-1)
@@ -636,6 +648,8 @@ static void job_delete(struct job* job)
 {
     job_kill(job);
     job_wait(job);
+    /* note: a 'struct process' does not allocate anything; it does not need to be destroyed;
+       this is convinient since we just use them to wrap execution, not*/
     free(job->procs);
     if (job->flags & 2) {
         job_argv_buffer_delete(&((struct job_ex*)job)->buf);
@@ -670,32 +684,97 @@ int job_error_flag(struct job* job)
     /* see if bit0 is set (binary 1) */
     return job->flags & 0x01;
 }
+pid_t job_process_group(struct job* job)
+{
+    return job->pgid;
+}
 void job_assign_stdio(struct job* job,int input,int output,int error)
 {
-    if (job->input != -1)
-        close(job->input);
-    job->input = input;
-    if (job->output != -1)
-        close(job->output);
-    job->output = output;
-    if (job->error != -1)
-        close(job->error);
-    job->error = error;
-
-}/*
-int job_exec(struct process* proc)
-{
+    if (job->proccnt > 0) {
+        if (job->input != -1)
+            close(job->input);
+        job->input = input;
+        job->procs[0].input = input;
+        if (job->output != -1)
+            close(job->output);
+        job->output = output;
+        job->procs[job->proccnt-1].output = output;
+        if (job->error != -1)
+            close(job->error);
+        job->error = error;
+        job->procs[job->proccnt-1].error = error;
+    }
 }
-int job_poll(struct job* job)
+int job_exec(struct job* job)
 {
+    if (job->pgid==-1 && job->proccnt>0) {
+        size_t i;
+        /* tell the first process to set its gid
+           to itself (create a new process group) */
+        job->procs[0].pgid = 0;
+        if (process_exec(job->procs) == -1)
+            return -1;
+        job->pgid = job->procs[0].pid;
+        /* set process group to prevent race conditions */
+        if (setpgid(job->procs[0].pid,job->pgid)==-1 && errno!=EACCES)
+            raise_exception("fail setpgid()");
+        /* execute remaining processes in pipeline */
+        for (i = 1;i < job->proccnt;++i) {
+            job->procs[i].pgid = job->pgid; /* set process group flag */
+            if (process_exec(job->procs+i) == -1)
+                /* fail - user should call job_delete */
+                return -1;
+            if (setpgid(job->procs[i].pid,job->pgid)==-1 && errno!=EACCES)
+                raise_exception("fail setpgid()");
+        }
+        return 0;
+    }
+    return -1;
 }
+/*int job_poll(struct job* job)
+{
+}*/
 int job_wait(struct job* job)
 {
-}
+    if (job->pgid != (pid_t)-1) {
+        while (1) {
+            size_t i;
+            pid_t pid;
+            int status;
+            if ((pid = waitpid(-job->pgid,&status,0)) == -1) {
+                if (errno == ECHILD) {
+                    job->pgid = (pid_t)-1;
+                    return 0;
+                }
+                raise_exception("fail waitpid()");
+            }
+            /* search for process structure to assign exit code */
+            for (i = 0;i < job->proccnt;++i)
+                if (job->procs[i].pid == pid)
+                    job->procs[i].exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        }
+        return 0;
+    }
+    return -1;
+}/*
 int job_wait_timeout(struct job* job,unsigned int msecs)
 {
+}*/
+int job_signal(struct job* job,int sig)
+{
+    if (job->pgid != (pid_t)-1) {
+        if (kill(-job->pgid,sig) == -1)
+            raise_exception("fail kill()");
+        return 0;
+    }
+    return -1;
 }
 int job_kill(struct job* job)
 {
+    if (job->pgid != (pid_t)-1) {
+        if (kill(-job->pgid,SIGKILL) == -1)
+            raise_exception("fail kill()");
+        return 0;
+    }
+    return -1;
 }
-*/

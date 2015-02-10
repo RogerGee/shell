@@ -17,7 +17,7 @@ struct process;
 struct process* process_new(const char* const argv[]); /* argv[n-1] is NULL */
 void process_free(struct process* proc);
 void process_assign_stdio(struct process* proc,int input,int output,int error);
-int process_exec(struct process* proc);
+int process_exec(struct process* proc); /* returns -1 on failure; 0 is started successfully */
 int process_poll(struct process* proc); /* returns: 0 if exited, 1 if still running */
 int process_wait(struct process* proc);
 int process_wait_timeout(struct process* proc,unsigned int msecs); /* returns: 0 if exited, 1 if timed-out */
@@ -38,11 +38,13 @@ struct job* job_new(struct job_argv_buffer* buffer); /* use command-line stored 
 struct job* job_new_ex(const char* cmdline); /* parse command-line; do not apply redirections */
 void job_free(struct job* job);
 int job_error_flag(struct job* job);
+pid_t job_process_group(struct job* job);
 void job_assign_stdio(struct job* job,int input,int output,int error); /* this will overwrite any previous redirections */
-int job_exec(struct process* proc);
+int job_exec(struct job* job);
 int job_poll(struct job* job);
 int job_wait(struct job* job);
 int job_wait_timeout(struct job* job,unsigned int msecs);
+int job_signal(struct job* job,int sig);
 int job_kill(struct job* job);
 
 #endif

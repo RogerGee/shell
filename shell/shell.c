@@ -4,7 +4,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <sys/fcntl.h>
 #include <unistd.h>
+#include <signal.h>
 
 const char* programName;
 void raise_exception(const char* message);
@@ -16,11 +18,13 @@ static int cd(const char* directory);
 /*static int pud(const char* directory);
   static int pod();*/
 static int readline(FILE* fin,char* buf,size_t cap);
+static void setup_signal_handlers();
 
 int main(int argc,const char* argv[])
 {
     programName = argv[0+(argc-argc)];
 
+    setup_signal_handlers();
     message_loop();
     return 0;
 }
@@ -33,12 +37,21 @@ void raise_exception(const char* message)
 
 void message_loop()
 {
+    int fdterm;
     int exitCode;
     char cmdline[4096];
     struct cmdargv* tokens;             /* store command-line tokens */
     struct job_argv_buffer* j_tokens;  /* store series of command-line tokens for job */
     tokens = cmdargv_new();
     j_tokens = job_argv_buffer_new();
+    fdterm = open(ctermid(NULL),O_RDWR);
+    if (fdterm == -1)
+        raise_exception("could not locate controlling terminal");
+
+    /* set ourselves initially as the foregroup job */
+    if (tcsetpgrp(fdterm,getpgrp()) == -1)
+        raise_exception("fail tcsetpgrp()");
+
 
     while (1) {
         int c = 0;
@@ -46,9 +59,11 @@ void message_loop()
         do {
             print_prompt(!c++);
 
-            if ( !readline(stdin,cmdline,sizeof(cmdline)) )
+            if ( !readline(stdin,cmdline,sizeof(cmdline)) ) {
                 /* received end-of-file on stdin */
+                putchar('\n');
                 goto done;
+            }
         } while ( !cmdargv_parse(tokens,cmdline) );
 
         argv = cmdargv_get_argv(tokens);
@@ -59,8 +74,26 @@ void message_loop()
             else if (strcmp(argv[0],"exit") == 0)
                 break;
             else {
+                /* transform the raw command-line into tokens the job can use */
                 if (job_argv_buffer_transform(j_tokens,tokens)) {
-
+                    struct job* job = job_new(j_tokens);
+                    if (!job_error_flag(job)) {
+                        /* job was successfully created; execute and wait on it */
+                        if (job_exec(job) == -1)
+                            fprintf(stderr,"%s: failed to execute job\n",programName);
+                        else {
+                            /* success; move the process group into the terminal foreground so
+                               that it receives signals from the terminal */
+                            if (tcsetpgrp(fdterm,job_process_group(job)) == -1)
+                                raise_exception("fail tcsetpgrp()");
+                            job_wait(job);
+                            /* replace our process group as the foregroup terminal process group */
+                            if (tcsetpgrp(fdterm,getpgrp()) == -1)
+                                raise_exception("fail tcsetpgrp()");
+                        }
+                        /* destroy the job */
+                        job_free(job);
+                    }
                 }
                 job_argv_buffer_reset(j_tokens);
             }
@@ -72,7 +105,7 @@ void message_loop()
 done:
     job_argv_buffer_free(j_tokens);
     cmdargv_free(tokens);
-    putchar('\n');
+    close(fdterm);
 }
 
 void print_prompt(int normalPrompt)
@@ -203,4 +236,11 @@ int readline(FILE* fin,char* buf,size_t cap)
         cap -= len;
     }
     return 1;
+}
+
+void setup_signal_handlers()
+{
+    if (signal(SIGTSTP,SIG_IGN)==SIG_ERR || signal(SIGINT,SIG_IGN)==SIG_ERR || signal(SIGQUIT,SIG_IGN)==SIG_ERR
+        || signal(SIGTTIN,SIG_IGN)==SIG_ERR || signal(SIGTTOU,SIG_IGN)==SIG_ERR || signal(SIGCHLD,SIG_IGN))
+        raise_exception("fail signal()");
 }
