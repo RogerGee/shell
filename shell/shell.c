@@ -38,21 +38,26 @@ void raise_exception(const char* message)
 void message_loop()
 {
     int fdterm;
-    int exitCode;
+    struct process_exit_info* exitCodes;
+    size_t exitCodes_top, exitCodes_cap;
     char cmdline[4096];
     struct cmdargv* tokens;             /* store command-line tokens */
     struct job_argv_buffer* j_tokens;  /* store series of command-line tokens for job */
+    /* initialize exit code structure */
+    exitCodes_top = 0;
+    exitCodes_cap = 8;
+    exitCodes = malloc(sizeof(struct process_exit_info) * exitCodes_cap);
+    /* initialize token structures */
     tokens = cmdargv_new();
     j_tokens = job_argv_buffer_new();
+    /* open up controlling terminal */
     fdterm = open(ctermid(NULL),O_RDWR);
     if (fdterm == -1)
         raise_exception("could not locate controlling terminal");
-
     /* set ourselves initially as the foregroup job */
     if (tcsetpgrp(fdterm,getpgrp()) == -1)
         raise_exception("fail tcsetpgrp()");
-
-
+    /* enter message loop */
     while (1) {
         int c = 0;
         const char* const* argv;
@@ -69,10 +74,26 @@ void message_loop()
         argv = cmdargv_get_argv(tokens);
         if (argv[0] != NULL) {
             /* check built-in commands first; otherwise run external command(s) */
-            if (strcmp(argv[0],"cd") == 0)
+            if (strcmp(argv[0],"cd") == 0) {
                 cd(argv[1]);
+                exitCodes[0].exitCode = 0;
+                exitCodes[0].exitSignal = PROC_UNDEFINED;
+                exitCodes_top = 1;
+            }
             else if (strcmp(argv[0],"exit") == 0)
                 break;
+            else if (strcmp(argv[0],"?") == 0) {
+                /* print exit codes from last job */
+                size_t i;
+                for (i = 0;i < exitCodes_top;++i) {
+                    if (exitCodes[i].exitCode != PROC_UNDEFINED)
+                        printf("%d\n",exitCodes[i].exitCode);
+                    else if (exitCodes[i].exitSignal != PROC_UNDEFINED)
+                        printf("%s\n",strsignal(exitCodes[i].exitSignal));
+                    else
+                        printf("undef\n");
+                }
+            }
             else {
                 /* transform the raw command-line into tokens the job can use */
                 if (job_argv_buffer_transform(j_tokens,tokens)) {
@@ -87,6 +108,25 @@ void message_loop()
                             if (tcsetpgrp(fdterm,job_process_group(job)) == -1)
                                 raise_exception("fail tcsetpgrp()");
                             job_wait(job);
+                            /* store last exit codes in exitCodes structure */
+                            exitCodes_top = 0;
+                            while (1) {
+                                struct process* proc;
+                                proc = job_get_proc(job,exitCodes_top);
+                                if (proc == NULL)
+                                    break;
+                                if (exitCodes_top >= exitCodes_cap) {
+                                    size_t newcapc;
+                                    void* newbuf;
+                                    newcapc = exitCodes_cap<<1;
+                                    newbuf = realloc(exitCodes,sizeof(struct process_exit_info)*newcapc);
+                                    if (newbuf == NULL)
+                                        raise_exception("memory error");
+                                    exitCodes_cap = newcapc;
+                                    exitCodes = newbuf;
+                                }
+                                exitCodes[exitCodes_top++] = *process_get_exit_info(proc);
+                            }
                             /* replace our process group as the foregroup terminal process group */
                             if (tcsetpgrp(fdterm,getpgrp()) == -1)
                                 raise_exception("fail tcsetpgrp()");
@@ -103,6 +143,7 @@ void message_loop()
     }
 
 done:
+    free(exitCodes);
     job_argv_buffer_free(j_tokens);
     cmdargv_free(tokens);
     close(fdterm);
@@ -241,6 +282,6 @@ int readline(FILE* fin,char* buf,size_t cap)
 void setup_signal_handlers()
 {
     if (signal(SIGTSTP,SIG_IGN)==SIG_ERR || signal(SIGINT,SIG_IGN)==SIG_ERR || signal(SIGQUIT,SIG_IGN)==SIG_ERR
-        || signal(SIGTTIN,SIG_IGN)==SIG_ERR || signal(SIGTTOU,SIG_IGN)==SIG_ERR || signal(SIGCHLD,SIG_IGN))
+        || signal(SIGTTIN,SIG_IGN)==SIG_ERR || signal(SIGTTOU,SIG_IGN)==SIG_ERR)
         raise_exception("fail signal()");
 }

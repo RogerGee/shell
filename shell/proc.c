@@ -192,8 +192,8 @@ struct process
     char* const* argv;
 
     /* running process */
-    pid_t pid, pgid;
-    int exitCode;
+    pid_t pid, pgid, pid_save;
+    struct process_exit_info exitInfo;
 };
 static void process_init(struct process* proc,const char* const argv[])
 {
@@ -202,7 +202,7 @@ static void process_init(struct process* proc,const char* const argv[])
     proc->argv = (char* const*)argv;
     proc->pid = (pid_t)-1;
     proc->pgid = (pid_t)-1;
-    proc->exitCode = -1;
+    proc->exitInfo.exitCode = proc->exitInfo.exitSignal = PROC_UNDEFINED;
 }
 static void process_delete(struct process* proc)
 {
@@ -259,6 +259,10 @@ int process_exec(struct process* proc)
                     raise_exception("fail dup2()");
                 close(proc->error);
             }
+            /* reset signal handlers */
+            if (signal(SIGTSTP,SIG_DFL)==SIG_ERR || signal(SIGINT,SIG_DFL)==SIG_ERR || signal(SIGQUIT,SIG_DFL)==SIG_ERR
+                || signal(SIGTTIN,SIG_DFL)==SIG_ERR || signal(SIGTTOU,SIG_DFL)==SIG_ERR)
+                raise_exception("fail signal()");
             /* try to execute the command */
             execvp(proc->exec,proc->argv);
             /* command could not be executed */
@@ -266,6 +270,10 @@ int process_exec(struct process* proc)
             exit(EXIT_FAILURE);
         }
         else { /* parent */
+            proc->pid_save = proc->pid;
+            /* set process group (if specified) to prevent race conditions */
+            if (proc->pgid!=-1 && setpgid(proc->pid,proc->pgid==0 ? proc->pid : proc->pgid)==-1 && errno!=EACCES)
+                raise_exception("fail setpgid()");
             /* close descriptors that were (hopefully) duped in the child */
             if (proc->input != -1)
                 close(proc->input);
@@ -292,9 +300,13 @@ int process_poll(struct process* proc)
             }
             raise_exception("fail waitpid()");
         }
-        if (r == 0)
+        if (r == 0) {
             /* child process terminated */
+            proc->pid = (pid_t)-1;
+            proc->exitInfo.exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : PROC_UNDEFINED;
+            proc->exitInfo.exitSignal = WIFSIGNALED(status) ? WTERMSIG(status) : PROC_UNDEFINED;
             return 0;
+        }
         /* child process is still running */
         return 1;
     }
@@ -313,7 +325,8 @@ int process_wait(struct process* proc)
             raise_exception("fail waitpid()");
         }
         proc->pid = (pid_t)-1;
-        proc->exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        proc->exitInfo.exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : PROC_UNDEFINED;
+        proc->exitInfo.exitSignal = WIFSIGNALED(status) ? WTERMSIG(status) : PROC_UNDEFINED;
         return 0;
     }
     return -1;
@@ -333,7 +346,8 @@ int process_wait_timeout(struct process* proc,unsigned int msecs)
         }
         if (r == proc->pid) {
             proc->pid = (pid_t)-1;
-            proc->exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+            proc->exitInfo.exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : PROC_UNDEFINED;
+            proc->exitInfo.exitSignal = WIFSIGNALED(status) ? WTERMSIG(status) : PROC_UNDEFINED;
             /* process exited */
             return 0;
         }
@@ -362,6 +376,10 @@ int process_kill(struct process* proc)
         return 0;
     }
     return -1;
+}
+struct process_exit_info* process_get_exit_info(struct process* proc)
+{
+    return &proc->exitInfo;
 }
 
 /* job_argv */
@@ -688,6 +706,12 @@ pid_t job_process_group(struct job* job)
 {
     return job->pgid;
 }
+struct process* job_get_proc(struct job* job,size_t index)
+{
+    if (index >= job->proccnt)
+        return NULL;
+    return job->procs+index;
+}
 void job_assign_stdio(struct job* job,int input,int output,int error)
 {
     if (job->proccnt > 0) {
@@ -715,17 +739,12 @@ int job_exec(struct job* job)
         if (process_exec(job->procs) == -1)
             return -1;
         job->pgid = job->procs[0].pid;
-        /* set process group to prevent race conditions */
-        if (setpgid(job->procs[0].pid,job->pgid)==-1 && errno!=EACCES)
-            raise_exception("fail setpgid()");
         /* execute remaining processes in pipeline */
         for (i = 1;i < job->proccnt;++i) {
             job->procs[i].pgid = job->pgid; /* set process group flag */
             if (process_exec(job->procs+i) == -1)
                 /* fail - user should call job_delete */
                 return -1;
-            if (setpgid(job->procs[i].pid,job->pgid)==-1 && errno!=EACCES)
-                raise_exception("fail setpgid()");
         }
         return 0;
     }
@@ -744,14 +763,18 @@ int job_wait(struct job* job)
             if ((pid = waitpid(-job->pgid,&status,0)) == -1) {
                 if (errno == ECHILD) {
                     job->pgid = (pid_t)-1;
-                    return 0;
+                    break;
                 }
                 raise_exception("fail waitpid()");
             }
             /* search for process structure to assign exit code */
-            for (i = 0;i < job->proccnt;++i)
-                if (job->procs[i].pid == pid)
-                    job->procs[i].exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+            for (i = 0;i < job->proccnt;++i) {
+                if (job->procs[i].pid == pid) {
+                    job->procs[i].pid = (pid_t)-1;
+                    job->procs[i].exitInfo.exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : PROC_UNDEFINED;
+                    job->procs[i].exitInfo.exitSignal = WIFSIGNALED(status) ? WTERMSIG(status) : PROC_UNDEFINED;
+                }
+            }
         }
         return 0;
     }
