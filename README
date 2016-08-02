@@ -1,0 +1,4 @@
+shell
+--------------------------------------------------------------------------------
+This is the code repository for CS 356 (Operating Systems). It includes a simple
+shell implementation. The shell supports I/O redirection and process groups.
